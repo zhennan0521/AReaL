@@ -59,7 +59,22 @@ def _dispatch_tensors(
     item_list: list[dict[str, Any]],
     dp_size: int,
 ) -> tuple[list[list[dict[str, Any]]], list[list[int]]]:
-    """Partition trajectories across DP groups by balanced token count."""
+    """Partition trajectories across DP groups by balanced token count.
+
+    If the batch size is not divisible by ``dp_size``, the trailing items
+    are silently dropped so that ``balanced_greedy_partition`` receives an
+    evenly divisible input.  This mirrors the ``drop_last`` semantics of
+    typical dataloaders and avoids crashing on the last incomplete batch
+    during evaluation.
+    """
+    n = len(item_list)
+    remainder = n % dp_size
+    if remainder != 0:
+        item_list = item_list[: n - remainder]
+
+    if not item_list:
+        return [[] for _ in range(dp_size)], [[] for _ in range(dp_size)]
+
     token_weights: list[int] = []
     for d in item_list:
         attn_mask = d.get("attention_mask")
