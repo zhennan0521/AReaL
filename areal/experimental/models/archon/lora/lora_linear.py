@@ -314,7 +314,7 @@ def sync_lora_grads(
         return
 
     for module in model.modules():
-        if isinstance(module, LoRALinear) and module._tp_enabled:
+        if isinstance(module, LoRALinear):
             for _pname, tensor in [
                 ("a", module._lora_a_weight),
                 ("b", module._lora_b_weight),
