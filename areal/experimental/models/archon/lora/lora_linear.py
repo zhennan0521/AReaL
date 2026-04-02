@@ -19,6 +19,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def _compute_lora_scaling(alpha: float, rank: int, peft_type: str = "lora") -> float:
+    """Compute LoRA scaling factor based on peft_type."""
+    if peft_type == "rslora":
+        return alpha / math.sqrt(rank)
+    return alpha / rank
+
+
 class LoRALinear(nn.Module):
     """Linear layer with Low-Rank Adaptation (LoRA).
 
@@ -41,13 +48,14 @@ class LoRALinear(nn.Module):
         alpha: float,
         dropout: float = 0.0,
         use_bias: bool = False,
+        peft_type: str = "lora",
     ):
         super().__init__()
         self.in_dim = in_dim
         self.out_dim = out_dim
         self.rank = rank
         self.alpha = alpha
-        self.scaling = alpha / rank
+        self.scaling = _compute_lora_scaling(alpha, rank, peft_type)
         self.disabled = False
         self._dropout_p = dropout
 
@@ -205,6 +213,7 @@ class LoRALinear(nn.Module):
         rank: int,
         alpha: float,
         dropout: float = 0.0,
+        peft_type: str = "lora",
     ) -> "LoRALinear":
         """Convert an existing nn.Linear to LoRALinear.
 
@@ -220,7 +229,7 @@ class LoRALinear(nn.Module):
         lora_linear.out_dim = linear.out_features
         lora_linear.rank = rank
         lora_linear.alpha = alpha
-        lora_linear.scaling = alpha / rank
+        lora_linear.scaling = _compute_lora_scaling(alpha, rank, peft_type)
         lora_linear.disabled = False
         lora_linear._dropout_p = dropout
 

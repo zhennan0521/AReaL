@@ -201,12 +201,14 @@ class ArchonEngine(TrainEngine):
                 rank: int
                 alpha: float
                 target_modules: list[str]
+                peft_type: str = "lora"
 
             self.lora_config = LoRAConfig(
                 enabled=True,
                 rank=config.lora_rank,
                 alpha=float(config.lora_alpha),
                 target_modules=config.target_modules if config.target_modules else [],
+                peft_type=getattr(config, "peft_type", "lora"),
             )
 
     def create_process_group(
@@ -1021,6 +1023,7 @@ class ArchonEngine(TrainEngine):
                         child,
                         rank=self.lora_config.rank,
                         alpha=self.lora_config.alpha,
+                        peft_type=self.lora_config.peft_type,
                     )
                     lora_mod._debug_name = child_prefix
                     setattr(parent_module, child_name, lora_mod)
