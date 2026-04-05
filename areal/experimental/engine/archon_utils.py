@@ -39,10 +39,16 @@ if TYPE_CHECKING:
 
 
 def create_optimizer(
-    params: list[torch.nn.Parameter],
+    params: list[torch.nn.Parameter] | list[dict],
     optimizer_config: OptimizerConfig,
 ) -> torch.optim.Optimizer:
-    """Create optimizer from config."""
+    """Create optimizer from config.
+
+    Args:
+        params: Either a flat list of parameters, or a list of param group dicts
+            (e.g. [{"params": [...], "lr": 1e-4}, {"params": [...], "lr": 2e-4}]).
+        optimizer_config: Optimizer configuration.
+    """
     lr = optimizer_config.lr
     weight_decay = optimizer_config.weight_decay
     beta1 = optimizer_config.beta1

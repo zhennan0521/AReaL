@@ -202,6 +202,7 @@ class ArchonEngine(TrainEngine):
                 alpha: float
                 target_modules: list[str]
                 peft_type: str = "lora"
+                loraplus_lr_ratio: float = 1.0
 
             self.lora_config = LoRAConfig(
                 enabled=True,
@@ -209,6 +210,7 @@ class ArchonEngine(TrainEngine):
                 alpha=float(config.lora_alpha),
                 target_modules=config.target_modules if config.target_modules else [],
                 peft_type=getattr(config, "peft_type", "lora"),
+                loraplus_lr_ratio=getattr(config, "loraplus_lr_ratio", 1.0),
             )
 
     def create_process_group(
@@ -1220,9 +1222,39 @@ class ArchonEngine(TrainEngine):
 
         tik = time.perf_counter()
 
-        self.optimizer = create_optimizer(
-            self._get_all_parameters(), self.optimizer_config
-        )
+        # LoRA+: split A and B into different param groups with different lr
+        if (
+            self.lora_config is not None
+            and self.lora_config.peft_type == "lora_plus"
+            and self.lora_config.loraplus_lr_ratio != 1.0
+        ):
+            from areal.experimental.models.archon.lora import LoRALinear
+
+            lora_a_params = []
+            lora_b_params = []
+            for m in self.model_parts:
+                for module in m.modules():
+                    if isinstance(module, LoRALinear):
+                        lora_a_params.append(module._lora_a_weight)
+                        lora_b_params.append(module._lora_b_weight)
+
+            base_params = [p for m in self.model_parts for p in m.parameters()]
+            base_lr = self.optimizer_config.lr
+            ratio = self.lora_config.loraplus_lr_ratio
+
+            param_groups = [
+                {"params": base_params + lora_a_params, "lr": base_lr},
+                {"params": lora_b_params, "lr": base_lr * ratio},
+            ]
+            self.logger.info(
+                f"LoRA+ optimizer: A lr={base_lr}, B lr={base_lr * ratio} (ratio={ratio})"
+            )
+            self.optimizer = create_optimizer(param_groups, self.optimizer_config)
+        else:
+            self.optimizer = create_optimizer(
+                self._get_all_parameters(), self.optimizer_config
+            )
+
         self.lr_scheduler = create_lr_scheduler(
             self.optimizer, self.optimizer_config, ft_spec.total_train_steps
         )

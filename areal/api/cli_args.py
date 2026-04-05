@@ -1098,6 +1098,14 @@ class TrainEngineConfig:
         default="lora",
         metadata={"help": "peft method type. Only LoRA is supported for now."},
     )
+    loraplus_lr_ratio: float = field(
+        default=1.0,
+        metadata={
+            "help": "LoRA+ learning rate ratio for B matrix. "
+            "B uses lr * ratio, A uses lr. Only effective when peft_type='lora_plus'. "
+            "Default 1.0 (same as standard LoRA). Paper recommends 2.0."
+        },
+    )
 
     # Tree training
     enable_tree_training: bool = field(
