@@ -5,7 +5,10 @@ from dataclasses import asdict
 
 import swanlab
 import torch.distributed as dist
-import trackio
+try:
+    import trackio
+except ImportError:
+    trackio = None
 import wandb
 from tensorboardX import SummaryWriter
 

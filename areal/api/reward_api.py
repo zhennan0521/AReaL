@@ -188,13 +188,14 @@ class AsyncRewardWrapper:
                     )
                     continue
                 else:
-                    logger.error("Max retries exceeded for unexpected error.")
+                    logger.error("Max retries exceeded for unexpected error. Returning reward=0.")
                     traceback.print_exc()
-                    raise e
+                    return 0.0
 
         # If we get here, all retries failed
         if last_exception:
+            logger.error("All retries failed. Returning reward=0.")
             traceback.print_exc()
-            raise last_exception
+            return 0.0
         else:
             raise RuntimeError("Reward computation failed after all retries.")

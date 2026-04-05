@@ -336,6 +336,10 @@ class LoRALinear(nn.Module):
             _init_svd_lora(lora_linear, mode="max")
         elif peft_type == "milora":
             _init_svd_lora(lora_linear, mode="min")
+        elif peft_type == "lorafa":
+            nn.init.kaiming_uniform_(lora_linear._lora_a_weight, a=math.sqrt(5))
+            nn.init.zeros_(lora_linear._lora_b_weight)
+            lora_linear._lora_a_weight.requires_grad_(False)
         else:
             nn.init.kaiming_uniform_(lora_linear._lora_a_weight, a=math.sqrt(5))
             nn.init.zeros_(lora_linear._lora_b_weight)
