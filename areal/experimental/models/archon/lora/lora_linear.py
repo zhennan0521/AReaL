@@ -41,6 +41,45 @@ def _init_milora_plus(lora_linear: "LoRALinear"):
     nn.init.zeros_(lora_linear._lora_b_weight)
 
 
+# peft_types that require modifying the base weight (not TP-compatible)
+_BASE_WEIGHT_MODIFY_TYPES = ("pissa", "milora")
+
+
+def _init_svd_lora(lora_linear: "LoRALinear", mode: str):
+    """SVD-based LoRA initialization that modifies the base weight.
+
+    Used by PiSSA (mode="max") and MiLoRA (mode="min").
+
+    Algorithm:
+        1. SVD: W = U @ diag(S) @ Vh
+        2. Select rank-r components (max or min singular values)
+        3. A = diag(sqrt(S_sel / scaling)) @ Vh_sel
+        4. B = U_sel @ diag(sqrt(S_sel / scaling))
+        5. W -= scaling * B @ A  (preserves W + scaling*BA = original W)
+    """
+    w = lora_linear.weight  # plain tensor, not DTensor (TP guard ensures this)
+    rank = lora_linear.rank
+    scaling = lora_linear.scaling
+
+    U, S, Vh = torch.linalg.svd(w.data.float(), full_matrices=False)
+
+    if mode == "max":
+        U_sel, S_sel, Vh_sel = U[:, :rank], S[:rank], Vh[:rank, :]
+    else:  # min
+        U_sel, S_sel, Vh_sel = U[:, -rank:], S[-rank:], Vh[-rank:, :]
+
+    S_scaled = S_sel / scaling
+    S_sqrt = torch.sqrt(S_scaled)
+    B_init = (U_sel @ torch.diag(S_sqrt)).contiguous().to(w.dtype)
+    A_init = (torch.diag(S_sqrt) @ Vh_sel).contiguous().to(w.dtype)
+
+    # Modify base weight: W -= scaling * B @ A so that W_new + scaling*BA = W_orig
+    w.data -= (scaling * B_init @ A_init)
+
+    lora_linear._lora_a_weight.data.copy_(A_init)
+    lora_linear._lora_b_weight.data.copy_(B_init)
+
+
 class LoRALinear(nn.Module):
     """Linear layer with Low-Rank Adaptation (LoRA).
 
@@ -285,8 +324,18 @@ class LoRALinear(nn.Module):
             else:
                 lora_linear._tp_style = "replicate"
 
+        if peft_type in _BASE_WEIGHT_MODIFY_TYPES and lora_linear._tp_enabled:
+            raise ValueError(
+                f"peft_type='{peft_type}' modifies base weights and is not "
+                f"compatible with TP. Use TP=1 or choose a different method."
+            )
+
         if peft_type == "milora_plus":
             _init_milora_plus(lora_linear)
+        elif peft_type == "pissa":
+            _init_svd_lora(lora_linear, mode="max")
+        elif peft_type == "milora":
+            _init_svd_lora(lora_linear, mode="min")
         else:
             nn.init.kaiming_uniform_(lora_linear._lora_a_weight, a=math.sqrt(5))
             nn.init.zeros_(lora_linear._lora_b_weight)
