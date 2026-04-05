@@ -26,6 +26,21 @@ def _compute_lora_scaling(alpha: float, rank: int, peft_type: str = "lora") -> f
     return alpha / rank
 
 
+def _init_milora_plus(lora_linear: "LoRALinear"):
+    """MiLoRA++ initialization: A = min singular value directions, B = 0.
+
+    Uses SVD to find the least-represented subspace of the original weight
+    and initializes LoRA A with those orthonormal directions. B is zero so
+    the model output is unchanged at initialization.
+    """
+    w = getattr(lora_linear.weight, "_local_tensor", lora_linear.weight)
+    _, _, Vh = torch.linalg.svd(w.detach().float(), full_matrices=False)
+    rank = lora_linear.rank
+    A_init = Vh[-rank:, :].contiguous().to(w.dtype)
+    lora_linear._lora_a_weight.data.copy_(A_init)
+    nn.init.zeros_(lora_linear._lora_b_weight)
+
+
 class LoRALinear(nn.Module):
     """Linear layer with Low-Rank Adaptation (LoRA).
 
@@ -270,8 +285,11 @@ class LoRALinear(nn.Module):
             else:
                 lora_linear._tp_style = "replicate"
 
-        nn.init.kaiming_uniform_(lora_linear._lora_a_weight, a=math.sqrt(5))
-        nn.init.zeros_(lora_linear._lora_b_weight)
+        if peft_type == "milora_plus":
+            _init_milora_plus(lora_linear)
+        else:
+            nn.init.kaiming_uniform_(lora_linear._lora_a_weight, a=math.sqrt(5))
+            nn.init.zeros_(lora_linear._lora_b_weight)
 
         # Preserve TP forward hooks registered by parallelize_module.
         lora_linear._forward_pre_hooks = linear._forward_pre_hooks.copy()
