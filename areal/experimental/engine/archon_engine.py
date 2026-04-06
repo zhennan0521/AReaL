@@ -1105,6 +1105,11 @@ class ArchonEngine(TrainEngine):
                     elif "lora_a" in name:
                         nn.init.kaiming_uniform_(tensor, a=math.sqrt(5))
 
+            # For DoRA: magnitude will be lazily initialized on first forward
+            # (after FSDP2 all-gathers the full weight). Just ensure the
+            # placeholder tensor is on the correct device.
+            # No action needed here — materialize_lora already moved it.
+
             adapter_param_count += len(adapter_params)
             set_trainable_params(model, set(adapter_params.keys()))
 

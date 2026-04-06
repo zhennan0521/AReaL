@@ -44,6 +44,9 @@ def _init_milora_plus(lora_linear: "LoRALinear"):
 # peft_types that require modifying the base weight (not TP-compatible)
 _BASE_WEIGHT_MODIFY_TYPES = ("pissa", "milora")
 
+# peft_types not compatible with TP (includes base-weight-modify + DoRA)
+_TP_INCOMPATIBLE_TYPES = ("pissa", "milora", "dora")
+
 
 def _init_svd_lora(lora_linear: "LoRALinear", mode: str):
     """SVD-based LoRA initialization that modifies the base weight.
@@ -138,23 +141,63 @@ class LoRALinear(nn.Module):
         nn.init.zeros_(self._lora_b_weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        base_out = F.linear(x, self.weight, self.bias)
-
         if self.disabled:
-            return base_out
+            return F.linear(x, self.weight, self.bias)
 
         if self._tp_enabled:
-            result = self._tp_lora_forward(x, base_out)
-            if result.requires_grad and hasattr(self, "_debug_name"):
-                _name = self._debug_name
+            return self._tp_lora_forward(x, F.linear(x, self.weight, self.bias))
 
-                result.register_hook(lambda grad: grad)
-            return result
+        if hasattr(self, "_dora_initialized"):
+            return self._dora_forward(x)
 
+        base_out = F.linear(x, self.weight, self.bias)
         h = F.dropout(x, p=self._dropout_p, training=self.training)
         h = F.linear(h, self._lora_a_weight)
         lora_out = F.linear(h, self._lora_b_weight)
         return base_out + self.scaling * lora_out
+
+    def _dora_forward(self, x: torch.Tensor) -> torch.Tensor:
+        """DoRA forward: magnitude * normalized(direction + lora_delta).
+
+        On first call, lazily initializes _dora_magnitude from the full weight
+        (which is available only after FSDP2 all-gathers in the forward hook).
+        """
+        # Lazy init: compute magnitude from full weight on first forward
+        if not self._dora_initialized:
+            with torch.no_grad():
+                w = self.weight  # full weight (FSDP2 all-gathered)
+                mag = torch.linalg.norm(w.detach().float(), dim=1).to(w.dtype)
+                mag.requires_grad_(True)
+                object.__setattr__(self, "_dora_magnitude", mag)
+            self._dora_initialized = True
+
+        # base output without bias (bias added separately at end)
+        base_out = F.linear(x, self.weight)
+
+        # lora output
+        h = F.dropout(x, p=self._dropout_p, training=self.training)
+        h = F.linear(h, self._lora_a_weight)
+        lora_out = F.linear(h, self._lora_b_weight)
+
+        # weight norm: ||W + scaling * B @ A||_dim1, detached (DoRA paper Section 4.3)
+        # Use no_grad to avoid saving the full [out, in] lora_weight for backward
+        with torch.no_grad():
+            lora_weight = self._lora_b_weight @ self._lora_a_weight
+            weight_norm = torch.linalg.norm(
+                self.weight + self.scaling * lora_weight,
+                dim=1,
+            ).to(x.dtype)
+
+        # mag_norm_scale = m / ||W + scaling*BA||, shape [1, out_dim]
+        mag_norm_scale = (self._dora_magnitude / weight_norm).view(1, -1)
+
+        # DoRA: (scale - 1) * Wx + scale * scaling * BAx
+        result = (mag_norm_scale - 1) * base_out + mag_norm_scale * self.scaling * lora_out
+
+        if self.bias is not None:
+            result = result + self.bias
+
+        return result
 
     def _tp_lora_forward(
         self, x: torch.Tensor, base_out: torch.Tensor
@@ -205,7 +248,10 @@ class LoRALinear(nn.Module):
 
     def lora_parameters(self) -> list[torch.Tensor]:
         """Return the raw LoRA weight tensors (for the optimizer)."""
-        return [self._lora_a_weight, self._lora_b_weight]
+        params = [self._lora_a_weight, self._lora_b_weight]
+        if hasattr(self, "_dora_magnitude"):
+            params.append(self._dora_magnitude)
+        return params
 
     def materialize_lora(self, device: torch.device) -> None:
         """Move LoRA weights from meta device to *device* and re-init."""
@@ -223,6 +269,8 @@ class LoRALinear(nn.Module):
                 device=device,
             ).requires_grad_(True)
             object.__setattr__(self, "_lora_b_weight", b)
+        # DoRA magnitude is lazily initialized on first forward,
+        # no materialize needed here.
 
     # ------------------------------------------------------------------
     # State dict helpers (plain tensors are invisible to nn.Module)
@@ -236,6 +284,9 @@ class LoRALinear(nn.Module):
         b = self._lora_b_weight if keep_vars else self._lora_b_weight.detach()
         destination[prefix + "_lora_a_weight"] = a
         destination[prefix + "_lora_b_weight"] = b
+        if hasattr(self, "_dora_initialized") and hasattr(self, "_dora_magnitude"):
+            m = self._dora_magnitude if keep_vars else self._dora_magnitude.detach()
+            destination[prefix + "_dora_magnitude"] = m
 
     def _load_from_state_dict(
         self, state_dict, prefix, local_metadata, strict, missing_keys,
@@ -243,6 +294,7 @@ class LoRALinear(nn.Module):
     ):
         a_key = prefix + "_lora_a_weight"
         b_key = prefix + "_lora_b_weight"
+        m_key = prefix + "_dora_magnitude"
         if a_key in state_dict:
             self._lora_a_weight.data.copy_(state_dict.pop(a_key))
         elif strict:
@@ -251,6 +303,16 @@ class LoRALinear(nn.Module):
             self._lora_b_weight.data.copy_(state_dict.pop(b_key))
         elif strict:
             missing_keys.append(b_key)
+        if m_key in state_dict:
+            mag_data = state_dict.pop(m_key)
+            if hasattr(self, "_dora_magnitude"):
+                self._dora_magnitude.data.copy_(mag_data)
+            else:
+                mag_data = mag_data.clone().requires_grad_(True)
+                object.__setattr__(self, "_dora_magnitude", mag_data)
+                self._dora_initialized = True
+        elif strict and hasattr(self, "_dora_initialized"):
+            missing_keys.append(m_key)
         super()._load_from_state_dict(
             state_dict, prefix, local_metadata, strict,
             missing_keys, unexpected_keys, error_msgs,
@@ -324,10 +386,10 @@ class LoRALinear(nn.Module):
             else:
                 lora_linear._tp_style = "replicate"
 
-        if peft_type in _BASE_WEIGHT_MODIFY_TYPES and lora_linear._tp_enabled:
+        if peft_type in _TP_INCOMPATIBLE_TYPES and lora_linear._tp_enabled:
             raise ValueError(
-                f"peft_type='{peft_type}' modifies base weights and is not "
-                f"compatible with TP. Use TP=1 or choose a different method."
+                f"peft_type='{peft_type}' is not compatible with TP. "
+                f"Use TP=1 or choose a different method."
             )
 
         if peft_type == "milora_plus":
@@ -340,6 +402,12 @@ class LoRALinear(nn.Module):
             nn.init.kaiming_uniform_(lora_linear._lora_a_weight, a=math.sqrt(5))
             nn.init.zeros_(lora_linear._lora_b_weight)
             lora_linear._lora_a_weight.requires_grad_(False)
+        elif peft_type == "dora":
+            nn.init.kaiming_uniform_(lora_linear._lora_a_weight, a=math.sqrt(5))
+            nn.init.zeros_(lora_linear._lora_b_weight)
+            # Magnitude will be lazily initialized on first forward,
+            # after FSDP2 all-gathers the full weight. Set a flag.
+            lora_linear._dora_initialized = False
         else:
             nn.init.kaiming_uniform_(lora_linear._lora_a_weight, a=math.sqrt(5))
             nn.init.zeros_(lora_linear._lora_b_weight)
@@ -360,7 +428,10 @@ class LoRALinear(nn.Module):
         return lora_linear
 
     def adapter_params(self) -> list[str]:
-        return ["_lora_a_weight", "_lora_b_weight"]
+        names = ["_lora_a_weight", "_lora_b_weight"]
+        if hasattr(self, "_dora_magnitude"):
+            names.append("_dora_magnitude")
+        return names
 
     def __repr__(self) -> str:
         return (
@@ -395,10 +466,13 @@ def sync_lora_grads(
 
     for module in model.modules():
         if isinstance(module, LoRALinear):
-            for _pname, tensor in [
+            tensors_to_sync = [
                 ("a", module._lora_a_weight),
                 ("b", module._lora_b_weight),
-            ]:
+            ]
+            if hasattr(module, "_dora_magnitude"):
+                tensors_to_sync.append(("m", module._dora_magnitude))
+            for _pname, tensor in tensors_to_sync:
                 if tensor.grad is not None:
                     grad = tensor.grad
                     if tp_group is not None:
