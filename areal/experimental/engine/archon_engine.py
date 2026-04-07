@@ -749,6 +749,17 @@ class ArchonEngine(TrainEngine):
         if meta.with_optim and meta.weight_format == "hf":
             save_optimizer_state(self, meta.path)
 
+    def save_pissa_base_model(self, path: str) -> None:
+        """Save the modified base model for PiSSA/MiLoRA.
+
+        After PiSSA/MiLoRA initialization, the base weights have been modified
+        (W -= scaling * BA). SGLang rollout needs this modified base model
+        instead of the original HF model. This method saves the full model
+        (with modified base weights) in HF format.
+        """
+        self.logger.info(f"Saving PiSSA/MiLoRA modified base model to {path}")
+        save_model_to_hf(self, path, self.tokenizer, None)
+
     def load(self, meta: SaveLoadMeta):
         """Load model from HuggingFace or DCP format.
 
@@ -1082,6 +1093,9 @@ class ArchonEngine(TrainEngine):
             get_adapter_params,
             set_trainable_params,
         )
+        from areal.experimental.models.archon.lora.lora_linear import (
+            _reinit_for_peft_type,
+        )
 
         adapter_param_count = 0
         for model in self.model_parts:
@@ -1096,14 +1110,15 @@ class ArchonEngine(TrainEngine):
             if not adapter_params:
                 continue
 
-            # Re-initialize lora_a (kaiming) and lora_b (zeros) so the
-            # initial LoRA contribution is exactly zero.
+            # Re-initialize LoRA weights based on peft_type.
+            # For standard lora/rslora/dora: kaiming A + zeros B.
+            # For pissa/milora: SVD on real weight, set A/B, modify base weight.
+            # For milora_plus: SVD for orthogonal A directions, zeros B.
+            # For lorafa: kaiming A + zeros B, then freeze A.
             with torch.no_grad():
-                for name, tensor in adapter_params.items():
-                    if "lora_b" in name:
-                        nn.init.zeros_(tensor)
-                    elif "lora_a" in name:
-                        nn.init.kaiming_uniform_(tensor, a=math.sqrt(5))
+                for module in model.modules():
+                    if isinstance(module, LoRALinear):
+                        _reinit_for_peft_type(module)
 
             # For DoRA: magnitude will be lazily initialized on first forward
             # (after FSDP2 all-gathers the full weight). Just ensure the
@@ -1120,6 +1135,16 @@ class ArchonEngine(TrainEngine):
 
         self.logger.info(
             f"Froze base weights and kept {adapter_param_count} adapter parameters trainable"
+        )
+
+        # Track whether base weights were modified (PiSSA/MiLoRA).
+        # Used by trainer to save modified base model for SGLang rollout.
+        from areal.experimental.models.archon.lora.lora_linear import (
+            _BASE_WEIGHT_MODIFY_TYPES,
+        )
+
+        self._base_weight_modified = (
+            self.lora_config.peft_type in _BASE_WEIGHT_MODIFY_TYPES
         )
 
     def _get_all_parameters(self) -> list[nn.Parameter]:

@@ -707,6 +707,10 @@ class PPOTrainer:
                 self.config.sglang.lora_paths = [
                     f"{self.config.gconfig.lora_name}-v0={lora_path}"
                 ]
+                # PiSSA/MiLoRA: use the modified base model for SGLang
+                pissa_path = getattr(self, "_pissa_base_model_path", None)
+                if pissa_path is not None:
+                    self.config.sglang.model_path = pissa_path
             engine_cls = RemoteSGLangEngine
             server_args = SGLangConfig.build_args(
                 sglang_config=self.config.sglang,
@@ -722,6 +726,10 @@ class PPOTrainer:
                 self.config.vllm.lora_modules = [
                     f"{self.config.gconfig.lora_name}-v0={lora_path}"
                 ]
+                # PiSSA/MiLoRA: use the modified base model for vLLM
+                pissa_path = getattr(self, "_pissa_base_model_path", None)
+                if pissa_path is not None:
+                    self.config.vllm.model = pissa_path
             engine_cls = RemotevLLMEngine
             server_args = vLLMConfig.build_args(
                 vllm_config=self.config.vllm,
@@ -759,19 +767,19 @@ class PPOTrainer:
         """Save initial LoRA weights for inference server pre-loading.
 
         Returns path to saved LoRA weights, or None if LoRA is disabled.
+        For PiSSA/MiLoRA, also saves the modified base model and stores
+        the path in self._pissa_base_model_path for SGLang to use.
         """
         if not self.config.actor.use_lora:
             return None
 
-        path = os.path.join(
-            Saver.get_model_save_root(
-                self.config.experiment_name,
-                self.config.trial_name,
-                self.config.cluster.fileroot,
-                name="actor",
-            ),
-            "initial_lora",
+        save_root = Saver.get_model_save_root(
+            self.config.experiment_name,
+            self.config.trial_name,
+            self.config.cluster.fileroot,
+            name="actor",
         )
+        path = os.path.join(save_root, "initial_lora")
 
         meta = SaveLoadMeta(
             path=path,
@@ -783,6 +791,19 @@ class PPOTrainer:
         )
         # Save LoRA weights using engine's HuggingFace save
         self.actor.save(meta=meta)
+
+        # For PiSSA/MiLoRA: save modified base model for SGLang rollout.
+        # These methods modify base weights (W -= scaling*BA), so SGLang
+        # must load the modified model instead of the original HF checkpoint.
+        from areal.experimental.models.archon.lora.lora_linear import (
+            _BASE_WEIGHT_MODIFY_TYPES,
+        )
+
+        self._pissa_base_model_path = None
+        if self.config.actor.peft_type in _BASE_WEIGHT_MODIFY_TYPES:
+            base_path = os.path.join(save_root, "pissa_base_model")
+            self.actor.save_pissa_base_model(base_path)
+            self._pissa_base_model_path = base_path
 
         return path
 

@@ -41,6 +41,118 @@ def _init_milora_plus(lora_linear: "LoRALinear"):
     nn.init.zeros_(lora_linear._lora_b_weight)
 
 
+def _reinit_for_peft_type(lora_linear: "LoRALinear"):
+    """Post-materialize re-initialization based on peft_type.
+
+    Called by _freeze_non_lora_params AFTER weights are on real device.
+    For pissa/milora: does SVD on real weight and modifies base weight.
+    For milora_plus: does SVD for orthogonal directions in A, zeros B.
+    For lorafa: kaiming A + zeros B, then freezes A.
+    For lora/rslora/dora/lora_plus: standard kaiming A + zeros B.
+    """
+    peft_type = getattr(lora_linear, "_peft_type", "lora")
+
+    if peft_type in ("pissa", "milora"):
+        _reinit_svd_lora(lora_linear, mode="max" if peft_type == "pissa" else "min")
+    elif peft_type == "milora_plus":
+        _reinit_milora_plus(lora_linear)
+    elif peft_type == "lorafa":
+        nn.init.kaiming_uniform_(lora_linear._lora_a_weight, a=math.sqrt(5))
+        nn.init.zeros_(lora_linear._lora_b_weight)
+        lora_linear._lora_a_weight.requires_grad_(False)
+    else:
+        # lora, rslora, dora, lora_plus — standard init
+        nn.init.kaiming_uniform_(lora_linear._lora_a_weight, a=math.sqrt(5))
+        nn.init.zeros_(lora_linear._lora_b_weight)
+
+
+def _reinit_svd_lora(lora_linear: "LoRALinear", mode: str):
+    """SVD-based LoRA init on real (materialized) weights.
+
+    Works with both plain tensors and FSDP2 DTensors.
+    For DTensors: all-gathers full weight, computes SVD, then applies
+    the base-weight delta only to the local shard.
+    """
+    from torch.distributed.tensor import DTensor
+
+    rank = lora_linear.rank
+    scaling = lora_linear.scaling
+    weight = lora_linear.weight
+
+    # Get full weight for SVD
+    if isinstance(weight, DTensor):
+        full_w = weight.full_tensor().detach().float()
+    else:
+        full_w = weight.data.detach().float()
+
+    U, S, Vh = torch.linalg.svd(full_w, full_matrices=False)
+
+    if mode == "max":
+        U_sel, S_sel, Vh_sel = U[:, :rank], S[:rank], Vh[:rank, :]
+    else:  # min
+        U_sel, S_sel, Vh_sel = U[:, -rank:], S[-rank:], Vh[-rank:, :]
+
+    S_scaled = S_sel / scaling
+    S_sqrt = torch.sqrt(S_scaled)
+    dtype = weight.dtype
+    B_init = (U_sel @ torch.diag(S_sqrt)).contiguous().to(dtype)
+    A_init = (torch.diag(S_sqrt) @ Vh_sel).contiguous().to(dtype)
+
+    # Set LoRA weights (plain tensors, always local)
+    lora_linear._lora_a_weight.data.copy_(A_init)
+    lora_linear._lora_b_weight.data.copy_(B_init)
+
+    # Modify base weight: W -= scaling * B @ A
+    delta = (scaling * B_init @ A_init)
+    if isinstance(weight, DTensor):
+        from torch.distributed.tensor import Shard
+
+        placement = weight.placements[0]
+        if isinstance(placement, Shard) and placement.dim == 0:
+            # Row-sharded: each rank holds a contiguous slice of rows
+            local_w = weight._local_tensor
+            shard_size = local_w.shape[0]
+            tp_rank = weight.device_mesh.get_local_rank(0)
+            start = tp_rank * shard_size
+            local_w.data -= delta[start : start + shard_size, :]
+        elif isinstance(placement, Shard) and placement.dim == 1:
+            # Column-sharded
+            local_w = weight._local_tensor
+            shard_size = local_w.shape[1]
+            tp_rank = weight.device_mesh.get_local_rank(0)
+            start = tp_rank * shard_size
+            local_w.data -= delta[:, start : start + shard_size]
+        else:
+            # Replicated
+            weight._local_tensor.data -= delta
+    else:
+        weight.data -= delta
+
+
+def _reinit_milora_plus(lora_linear: "LoRALinear"):
+    """MiLoRA++ re-init on real (materialized) weights.
+
+    A = min singular value directions (orthonormal), B = 0.
+    No base weight modification needed.
+    Works with both plain tensors and DTensors.
+    """
+    from torch.distributed.tensor import DTensor
+
+    weight = lora_linear.weight
+
+    if isinstance(weight, DTensor):
+        full_w = weight.full_tensor().detach().float()
+    else:
+        full_w = weight.data.detach().float()
+
+    _, _, Vh = torch.linalg.svd(full_w, full_matrices=False)
+    rank = lora_linear.rank
+    A_init = Vh[-rank:, :].contiguous().to(weight.dtype)
+
+    lora_linear._lora_a_weight.data.copy_(A_init)
+    nn.init.zeros_(lora_linear._lora_b_weight)
+
+
 # peft_types that require modifying the base weight (not TP-compatible)
 _BASE_WEIGHT_MODIFY_TYPES = ("pissa", "milora")
 
@@ -161,6 +273,12 @@ class LoRALinear(nn.Module):
 
         On first call, lazily initializes _dora_magnitude from the full weight
         (which is available only after FSDP2 all-gathers in the forward hook).
+
+        Memory-efficient formulation: instead of
+            (mag_scale - 1) * base_out + mag_scale * s * lora_out
+        which saves both base_out and lora_out for backward, we use:
+            mag_scale * (base_out + s * lora_out)
+        which only saves the combined standard_out (same size as vanilla LoRA).
         """
         # Lazy init: compute magnitude from full weight on first forward
         if not self._dora_initialized:
@@ -171,16 +289,14 @@ class LoRALinear(nn.Module):
                 object.__setattr__(self, "_dora_magnitude", mag)
             self._dora_initialized = True
 
-        # base output without bias (bias added separately at end)
+        # Standard LoRA output (without bias)
         base_out = F.linear(x, self.weight)
-
-        # lora output
         h = F.dropout(x, p=self._dropout_p, training=self.training)
         h = F.linear(h, self._lora_a_weight)
         lora_out = F.linear(h, self._lora_b_weight)
+        standard_out = base_out + self.scaling * lora_out
 
         # weight norm: ||W + scaling * B @ A||_dim1, detached (DoRA paper Section 4.3)
-        # Use no_grad to avoid saving the full [out, in] lora_weight for backward
         with torch.no_grad():
             lora_weight = self._lora_b_weight @ self._lora_a_weight
             weight_norm = torch.linalg.norm(
@@ -191,8 +307,8 @@ class LoRALinear(nn.Module):
         # mag_norm_scale = m / ||W + scaling*BA||, shape [1, out_dim]
         mag_norm_scale = (self._dora_magnitude / weight_norm).view(1, -1)
 
-        # DoRA: (scale - 1) * Wx + scale * scaling * BAx
-        result = (mag_norm_scale - 1) * base_out + mag_norm_scale * self.scaling * lora_out
+        # DoRA: mag_scale * standard_LoRA_out (saves only 1 activation, not 2)
+        result = mag_norm_scale * standard_out
 
         if self.bias is not None:
             result = result + self.bias
@@ -348,6 +464,7 @@ class LoRALinear(nn.Module):
         lora_linear.scaling = _compute_lora_scaling(alpha, rank, peft_type)
         lora_linear.disabled = False
         lora_linear._dropout_p = dropout
+        lora_linear._peft_type = peft_type
 
         lora_linear.weight = linear.weight
         if linear.bias is not None:

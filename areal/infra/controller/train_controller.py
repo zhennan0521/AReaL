@@ -563,6 +563,10 @@ class TrainController:
         """
         self._custom_function_call("save", meta)
 
+    def save_pissa_base_model(self, path: str):
+        """Save modified base model for PiSSA/MiLoRA SGLang rollout."""
+        self._custom_function_call("save_pissa_base_model", path)
+
     def load(self, meta: SaveLoadMeta):
         """Load model weights and optimizer states from a file.
 
